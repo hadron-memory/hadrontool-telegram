@@ -1,0 +1,77 @@
+// hadrontool-telegram — the tool's OWN small database.
+//
+// Boundary (spec 042, decided 2026-07-09/10): this tool owns everything
+// provider-specific — encrypted bot tokens, the getUpdates poll cursor,
+// idempotency records. It is Hadron-blind: no core tables, no core API.
+// hadron-server keeps only the connection identity record and runs
+// authorization BEFORE it ever calls this service; the only tool→core
+// channel is the normalized events ingress.
+
+generator client {
+  provider = "prisma-client"
+  output   = "../src/generated/prisma"
+}
+
+datasource db {
+  provider = "postgresql"
+}
+
+enum ConnectionStatus {
+  ACTIVE
+  ERROR
+}
+
+/// One registered Telegram bot. The `id` is returned to hadron-server at
+/// creation time and is the `connectionId` every operation call carries.
+model Connection {
+  id          String           @id @default(cuid())
+  provider    String           @default("telegram")
+  /// Telegram's numeric bot id (from getMe), stored as a decimal string —
+  /// Telegram ids are int64 and never arithmetic here.
+  botId       String           @map("bot_id")
+  botUsername String           @map("bot_username")
+  displayName String?          @map("display_name")
+  /// getMe.can_read_all_group_messages at registration time — core's
+  /// group-binding validation re-checks live via the get-me op; this copy
+  /// is identity metadata, not the gate.
+  canReadAllGroupMessages Boolean @default(false) @map("can_read_all_group_messages")
+  /// AES-256-GCM-encrypted bot token (iv‖tag‖ciphertext, base64), under
+  /// this tool's own TOKEN_ENCRYPTION_KEY — never core's key.
+  tokenEnc    String           @map("token_enc")
+  status      ConnectionStatus @default(ACTIVE)
+  /// Error message from the last permanent provider-auth failure.
+  lastError   String?          @map("last_error")
+  /// getUpdates cursor: highest update_id whose event core has CONFIRMED
+  /// (2xx) or that needed no delivery. Advancing past an update confirms it
+  /// to Telegram (server-side delete), so this only moves after durable
+  /// handling — the spec-042 delivery-semantics invariant.
+  lastUpdateId BigInt          @default(0) @map("last_update_id")
+  /// Soft toggle — operator can pause polling without removing the bot.
+  pollingEnabled Boolean       @default(true) @map("polling_enabled")
+  createdAt   DateTime         @default(now()) @map("created_at")
+  updatedAt   DateTime         @updatedAt @map("updated_at")
+  deletedAt   DateTime?        @map("deleted_at")
+
+  @@index([botId])
+  @@map("connections")
+}
+
+/// Idempotency records for mutating operations (at-least-once callers).
+/// Created as an in-flight RESERVATION before the provider mutation runs
+/// (responseJson null), completed with the response after — so concurrent
+/// duplicates cannot both execute. A replayed completed key returns the
+/// stored response without touching the provider.
+model IdempotencyRecord {
+  key          String   @id
+  operation    String
+  /// SHA-256 of the operation input — a key replayed with a DIFFERENT
+  /// payload is rejected instead of leaking the stored response.
+  requestHash  String   @map("request_hash")
+  /// JSON-serialized operation response; null while the original request is
+  /// still in flight.
+  responseJson String?  @map("response_json")
+  createdAt    DateTime @default(now()) @map("created_at")
+
+  @@index([createdAt])
+  @@map("idempotency_records")
+}
