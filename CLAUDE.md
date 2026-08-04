@@ -35,7 +35,7 @@ Tests run the real Express app + real Postgres over the fake provider in
 ## Where things live
 
 - Spec/plan: `hadron-server/specs/042-telegram-integration/plan.md`; decision
-  node `hadronmemory.com::hadron-server::reference:hadrontool-telegram`;
+  node `hrn:node:hadronmemory.com:hadron-server:reference:hadrontool-telegram`;
   tracking hadron-server#592.
 - Error codes are a PUBLIC contract (core's telegramClient passes them
   through verbatim) — add codes, never change meanings (src/errors.ts).

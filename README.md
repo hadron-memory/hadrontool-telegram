@@ -12,7 +12,7 @@ API. Tool→core is the normalized events ingress only; core→tool is `/ops/*`
 only. When an op needs Hadron context, core passes it in the request.
 
 Design + decision record: `hadron-server/specs/042-telegram-integration/plan.md`
-and `hrn:node:hadronmemory.com::hadron-server::reference:hadrontool-telegram`.
+and `hrn:node:hadronmemory.com:hadron-server:reference:hadrontool-telegram`.
 Tracking: hadron-server#592. Pattern precedent: hadrontool-ms-exchange (#396).
 
 ## Surface
