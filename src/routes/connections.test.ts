@@ -141,7 +141,8 @@ describe('POST /connections registrationKey (#5, tool half of hadron-server#4829
       for (const b of bodies) expect(JSON.stringify(b)).not.toMatch(new RegExp(`${KEY}|${OTHER}`));
       expect(lines.join('\n')).not.toMatch(new RegExp(`${KEY}|${OTHER}`));
       const row = await db.connection.findFirst({ where: { deletedAt: null } });
-      expect(JSON.stringify(row)).not.toContain(KEY);
+      expect(Object.values(row!).map(String).join('|')).not.toContain(KEY);
+      expect(row!.registrationKeyHash).toMatch(/^[0-9a-f]{64}$/);
     } finally {
       spies.forEach((s) => s.mockRestore());
     }
@@ -160,10 +161,40 @@ describe('POST /connections registrationKey (#5, tool half of hadron-server#4829
 
   it('concurrent registrations with the same key converge on one row', async () => {
     const app = createApp(db, fakeProvider(), noopForward);
-    const results = await Promise.all([1, 2, 3, 4].map(() => post(app, { registrationKey: KEY })));
-    expect(results.map((r) => r.status).sort()).toEqual([200, 200, 200, 201]);
+    const results = await Promise.all(Array.from({ length: 12 }, (_, i) => i).map(() => post(app, { registrationKey: KEY })));
+    expect(results.map((r) => r.status).sort()).toEqual([...Array(11).fill(200), 201]);
     expect(new Set(results.map((r) => r.body.id)).size).toBe(1);
     expect(await db.connection.count({ where: { deletedAt: null } })).toBe(1);
+  });
+});
+
+describe('registration is serialized per bot (advisory lock)', () => {
+  it('a registration waits while another transaction holds the bot lock, then proceeds', async () => {
+    const app = createApp(db, fakeProvider(), noopForward);
+    let release!: () => void;
+    const gate = new Promise<void>((r) => (release = r));
+    let locked!: () => void;
+    const held = new Promise<void>((r) => (locked = r));
+    const holder = db.$transaction(
+      async (tx) => {
+        await tx.$executeRaw`SELECT pg_advisory_xact_lock(hashtext(${'telegram-register:7777'}))`;
+        locked();
+        await gate;
+      },
+      { timeout: 10_000 },
+    );
+    await held;
+    let done = false;
+    const pending = request(app)
+      .post('/connections')
+      .set(AUTH)
+      .send({ botToken: 't-1' })
+      .then((r) => ((done = true), r));
+    await new Promise((r) => setTimeout(r, 300));
+    expect(done).toBe(false);
+    release();
+    await holder;
+    expect((await pending).status).toBe(201);
   });
 });
 
