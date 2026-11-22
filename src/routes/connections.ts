@@ -24,7 +24,14 @@ const createSchema = z.object({
    * Opaque idempotency key (16-128 chars), derived by the caller from its own
    * identity. A retry that reproduces it adopts the registration it created.
    */
-  registrationKey: z.string().min(16).max(128).optional(),
+  registrationKey: z
+    .string()
+    .min(16)
+    .max(128)
+    // A lone surrogate hashes (as UTF-8) to the same bytes as U+FFFD, so two
+    // distinct accepted keys could collide: refuse ill-formed Unicode.
+    .refine((k) => !/\p{Surrogate}/u.test(k), 'must be well-formed text')
+    .optional(),
 });
 
 /** Digest stored for a key: the key itself is never persisted. */

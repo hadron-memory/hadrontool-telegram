@@ -168,6 +168,24 @@ describe('POST /connections registrationKey (#5, tool half of hadron-server#4829
   });
 });
 
+describe('registrationKey with ill-formed Unicode (local review P2)', () => {
+  it('a lone surrogate never aliases another key: it is a validation error, and U+FFFD does not adopt', async () => {
+    const app = createApp(db, fakeProvider(), noopForward);
+    const good = 'a'.repeat(20) + '\uFFFD';
+    const first = await request(app).post('/connections').set(AUTH).send({ botToken: 't-1', registrationKey: good });
+    expect(first.status).toBe(201);
+    // Raw JSON so the lone surrogate survives to the server as \ud800.
+    const bad = await request(app)
+      .post('/connections')
+      .set(AUTH)
+      .set('content-type', 'application/json')
+      .send(`{"botToken":"t-1","registrationKey":"${'a'.repeat(20)}\\ud800"}`);
+    expect(bad.status).toBe(400);
+    expect(bad.body.field).toBe('registrationKey');
+    expect(JSON.stringify(bad.body)).not.toContain(first.body.id);
+  });
+});
+
 describe('registration is serialized per bot (advisory lock)', () => {
   it('a registration waits while another transaction holds the bot lock, then proceeds', async () => {
     const app = createApp(db, fakeProvider(), noopForward);
