@@ -23,6 +23,12 @@ const createSchema = z.object({
   /**
    * Opaque idempotency key (16-128 chars), derived by the caller from its own
    * identity. A retry that reproduces it adopts the registration it created.
+   * Callers must derive it with at least 128 bits of entropy (core sends a
+   * keyed digest): only its unsalted SHA-256 is stored, which is safe for a
+   * high-entropy key and would not be for a guessable one. Adoption returns
+   * the stored registration as it is: a retry with a different bot token has a
+   * different derived key (core derives from App + credential), so it is
+   * refused rather than adopted, and the stored token is never replaced here.
    */
   registrationKey: z
     .string()
@@ -77,6 +83,7 @@ export function connectionsRouter(db: Db, provider: TelegramProvider): Router {
       // check and the insert run under a per-bot advisory lock so concurrent
       // retries of one registration converge on one row.
       const botId = String(me.id);
+      const botUsername = me.username; // narrowed by the guard above; no non-null assertion below
       const outcome = await db.$transaction(async (tx) => {
         await tx.$executeRaw`SELECT pg_advisory_xact_lock(hashtext(${'telegram-register:' + botId}))`;
         const existing = await tx.connection.findFirst({ where: { botId, deletedAt: null } });
@@ -93,7 +100,7 @@ export function connectionsRouter(db: Db, provider: TelegramProvider): Router {
         const connection = await tx.connection.create({
           data: {
             botId,
-            botUsername: me.username!,
+            botUsername,
             displayName: [me.first_name, me.last_name].filter(Boolean).join(' ') || null,
             canReadAllGroupMessages: me.can_read_all_group_messages ?? false,
             tokenEnc: encryptToken(input.botToken),
