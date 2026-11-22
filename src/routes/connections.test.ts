@@ -5,7 +5,7 @@
  * bot for re-registration.
  */
 import request from 'supertest';
-import { afterAll, beforeEach, describe, expect, it } from 'vitest';
+import { afterAll, beforeEach, describe, expect, it, vi } from 'vitest';
 import { createApp } from '../app.js';
 import { decryptToken } from '../crypto.js';
 import { db } from '../db.js';
@@ -69,6 +69,101 @@ describe('POST /connections', () => {
     const second = await request(app).post('/connections').set(AUTH).send({ botToken: 't-1' });
     expect(second.status).toBe(201);
     expect(second.body.id).not.toBe(first.body.id);
+  });
+});
+
+describe('POST /connections registrationKey (#5, tool half of hadron-server#4829)', () => {
+  const KEY = 'k'.repeat(32);
+  const OTHER = 'z'.repeat(32);
+  const post = (app: ReturnType<typeof createApp>, body: Record<string, unknown>) =>
+    request(app).post('/connections').set(AUTH).send({ botToken: 't-1', ...body });
+
+  it('the same key twice returns the one connection (200, same body as 201) and leaves one row', async () => {
+    const app = createApp(db, fakeProvider(), noopForward);
+    const first = await post(app, { registrationKey: KEY });
+    const second = await post(app, { registrationKey: KEY });
+    expect(first.status).toBe(201);
+    expect(second.status).toBe(200);
+    expect(second.body).toEqual(first.body);
+    expect(await db.connection.count({ where: { deletedAt: null } })).toBe(1);
+  });
+
+  it('a different key is refused with 400, and the refusal names no connection id', async () => {
+    const app = createApp(db, fakeProvider(), noopForward);
+    const first = await post(app, { registrationKey: KEY });
+    const res = await post(app, { registrationKey: OTHER });
+    expect(res.status).toBe(400);
+    expect(res.body.reason).toContain('already exists');
+    expect(JSON.stringify(res.body)).not.toContain(first.body.id);
+  });
+
+  it('a legacy row with no key is refused for a keyed caller, without its id', async () => {
+    const app = createApp(db, fakeProvider(), noopForward);
+    const legacy = await post(app, {});
+    const res = await post(app, { registrationKey: KEY });
+    expect(res.status).toBe(400);
+    expect(JSON.stringify(res.body)).not.toContain(legacy.body.id);
+    expect(await db.connection.count({ where: { deletedAt: null } })).toBe(1);
+  });
+
+  it('a keyless caller is refused against a keyed row, without its id (no key: unchanged)', async () => {
+    const app = createApp(db, fakeProvider(), noopForward);
+    const keyed = await post(app, { registrationKey: KEY });
+    const res = await post(app, {});
+    expect(res.status).toBe(400);
+    expect(JSON.stringify(res.body)).not.toContain(keyed.body.id);
+  });
+
+  it('never adopts a deleted connection: the same key after teardown registers a new one', async () => {
+    const app = createApp(db, fakeProvider(), noopForward);
+    const first = await post(app, { registrationKey: KEY });
+    await request(app).delete(`/connections/${first.body.id}`).set(AUTH);
+    const again = await post(app, { registrationKey: KEY });
+    expect(again.status).toBe(201);
+    expect(again.body.id).not.toBe(first.body.id);
+    const old = await db.connection.findUnique({ where: { id: first.body.id } });
+    expect(old!.deletedAt).not.toBeNull();
+  });
+
+  it('the key appears in no response and no log line, and the refusal and 200 do not echo it', async () => {
+    const lines: string[] = [];
+    const spies = [vi.spyOn(console, 'log'), vi.spyOn(console, 'error'), vi.spyOn(console, 'warn')].map((s) =>
+      s.mockImplementation((...a: unknown[]) => void lines.push(a.map(String).join(' '))),
+    );
+    try {
+      const app = createApp(db, fakeProvider(), noopForward);
+      const bodies = [
+        (await post(app, { registrationKey: KEY })).body,
+        (await post(app, { registrationKey: KEY })).body,
+        (await post(app, { registrationKey: OTHER })).body,
+        (await post(app, { registrationKey: 'short' })).body,
+      ];
+      for (const b of bodies) expect(JSON.stringify(b)).not.toMatch(new RegExp(`${KEY}|${OTHER}`));
+      expect(lines.join('\n')).not.toMatch(new RegExp(`${KEY}|${OTHER}`));
+      const row = await db.connection.findFirst({ where: { deletedAt: null } });
+      expect(JSON.stringify(row)).not.toContain(KEY);
+    } finally {
+      spies.forEach((s) => s.mockRestore());
+    }
+  });
+
+  it('a key outside 16-128 characters (or not a string) is a validation error', async () => {
+    const app = createApp(db, fakeProvider(), noopForward);
+    for (const bad of ['x'.repeat(15), 'x'.repeat(129), 42, '']) {
+      const res = await post(app, { registrationKey: bad });
+      expect(res.status).toBe(400);
+      expect(res.body.field).toBe('registrationKey');
+    }
+    expect(await db.connection.count()).toBe(0);
+    expect((await post(app, { registrationKey: 'x'.repeat(16) })).status).toBe(201);
+  });
+
+  it('concurrent registrations with the same key converge on one row', async () => {
+    const app = createApp(db, fakeProvider(), noopForward);
+    const results = await Promise.all([1, 2, 3, 4].map(() => post(app, { registrationKey: KEY })));
+    expect(results.map((r) => r.status).sort()).toEqual([200, 200, 200, 201]);
+    expect(new Set(results.map((r) => r.body.id)).size).toBe(1);
+    expect(await db.connection.count({ where: { deletedAt: null } })).toBe(1);
   });
 });
 
