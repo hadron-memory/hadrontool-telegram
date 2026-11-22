@@ -20,7 +20,7 @@ Tracking: hadron-server#592. Pattern precedent: hadrontool-ms-exchange (#396).
 | Method | Path | Purpose |
 |---|---|---|
 | `POST` | `/ops/<operation>` | Provider-neutral message operations (spec 042 names) |
-| `POST` | `/connections` | Register a bot (`{botToken}` — validated live via getMe) |
+| `POST` | `/connections` | Register a bot (`{botToken, registrationKey?}` — validated live via getMe). `registrationKey` is optional, opaque, 16-128 chars: a retry with the key that created an active registration returns it (200, same body as the 201); any other second registration for the bot is refused (400, naming no connection id). The key is never logged or echoed (only its SHA-256 is stored) |
 | `GET` | `/connections/:id` | Connection identity + poll state |
 | `DELETE` | `/connections/:id` | Soft-delete (polling stops itself) |
 | `GET` | `/info` | Capabilities (operation + event list) |

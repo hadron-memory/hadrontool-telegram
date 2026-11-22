@@ -8,6 +8,7 @@
  * its own key, and returns the identity. Core stores only that identity —
  * the token never appears in any response or log.
  */
+import { createHash, timingSafeEqual } from 'node:crypto';
 import { Router } from 'express';
 import { z } from 'zod';
 import { encryptToken } from '../crypto.js';
@@ -19,7 +20,38 @@ import { respondWithError } from './respond.js';
 
 const createSchema = z.object({
   botToken: z.string().min(1),
+  /**
+   * Opaque idempotency key (16-128 chars), derived by the caller from its own
+   * identity. A retry that reproduces it adopts the registration it created.
+   * Callers must derive it with at least 128 bits of entropy (core sends a
+   * keyed digest): only its unsalted SHA-256 is stored, which is safe for a
+   * high-entropy key and would not be for a guessable one. Adoption returns
+   * the stored registration as it is: a retry with a different bot token has a
+   * different derived key (core derives from App + credential), so it is
+   * refused rather than adopted, and the stored token is never replaced here.
+   */
+  registrationKey: z
+    .string()
+    .min(16)
+    .max(128)
+    // A lone surrogate hashes (as UTF-8) to the same bytes as U+FFFD, so two
+    // distinct accepted keys could collide: refuse ill-formed Unicode.
+    .refine((k) => !/\p{Surrogate}/u.test(k), 'must be well-formed text')
+    .optional(),
 });
+
+/** Digest stored for a key: the key itself is never persisted. */
+function keyDigest(key: string): string {
+  return createHash('sha256').update(key).digest('hex');
+}
+
+/** Constant-time digest equality; a NULL stored digest (legacy row) never matches. */
+function sameKey(stored: string | null, supplied: string | undefined): boolean {
+  if (!stored || supplied === undefined) return false;
+  const a = Buffer.from(stored, 'hex');
+  const b = Buffer.from(keyDigest(supplied), 'hex');
+  return a.length === b.length && timingSafeEqual(a, b);
+}
 
 /** Build the /connections router over injected db + provider. */
 export function connectionsRouter(db: Db, provider: TelegramProvider): Router {
@@ -47,25 +79,43 @@ export function connectionsRouter(db: Db, provider: TelegramProvider): Router {
       }
 
       // One active connection per bot: a second registration would start a
-      // competing getUpdates poller, which Telegram rejects with 409s.
-      const existing = await db.connection.findFirst({
-        where: { botId: String(me.id), deletedAt: null },
+      // competing getUpdates poller, which Telegram rejects with 409s. The
+      // check and the insert run under a per-bot advisory lock so concurrent
+      // retries of one registration converge on one row.
+      const botId = String(me.id);
+      const botUsername = me.username; // narrowed by the guard above; no non-null assertion below
+      const outcome = await db.$transaction(async (tx) => {
+        await tx.$executeRaw`SELECT pg_advisory_xact_lock(hashtext(${'telegram-register:' + botId}))`;
+        const existing = await tx.connection.findFirst({ where: { botId, deletedAt: null } });
+        if (existing) {
+          // Adopted only by the caller that proves it created the row: the stored
+          // digest equals the supplied key's. A different key, a legacy NULL-key
+          // row and a keyless caller all keep the 400 — which never names the
+          // other holder's connection id.
+          if (sameKey(existing.registrationKeyHash, input.registrationKey)) {
+            return { created: false as const, connection: existing };
+          }
+          throw new ValidationError('botToken', `a connection for @${me.username} already exists`);
+        }
+        const connection = await tx.connection.create({
+          data: {
+            botId,
+            botUsername,
+            displayName: [me.first_name, me.last_name].filter(Boolean).join(' ') || null,
+            canReadAllGroupMessages: me.can_read_all_group_messages ?? false,
+            tokenEnc: encryptToken(input.botToken),
+            registrationKeyHash: input.registrationKey === undefined ? null : keyDigest(input.registrationKey),
+          },
+        });
+        return { created: true as const, connection };
       });
-      if (existing) {
-        throw new ValidationError('botToken', `a connection for @${me.username} already exists (${existing.id})`);
+      const { connection } = outcome;
+      if (outcome.created) {
+        logInfo(`connection created for @${connection.botUsername} (${connection.id})`);
+      } else {
+        logInfo(`connection adopted for @${connection.botUsername} (${connection.id})`);
       }
-
-      const connection = await db.connection.create({
-        data: {
-          botId: String(me.id),
-          botUsername: me.username,
-          displayName: [me.first_name, me.last_name].filter(Boolean).join(' ') || null,
-          canReadAllGroupMessages: me.can_read_all_group_messages ?? false,
-          tokenEnc: encryptToken(input.botToken),
-        },
-      });
-      logInfo(`connection created for @${connection.botUsername} (${connection.id})`);
-      res.status(201).json({
+      res.status(outcome.created ? 201 : 200).json({
         id: connection.id,
         provider: connection.provider,
         botId: connection.botId,

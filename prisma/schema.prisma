@@ -38,6 +38,10 @@ model Connection {
   /// AES-256-GCM-encrypted bot token (iv‖tag‖ciphertext, base64), under
   /// this tool's own TOKEN_ENCRYPTION_KEY — never core's key.
   tokenEnc    String           @map("token_enc")
+  /// SHA-256 (hex) of the caller's opaque `registrationKey` (#5, hadron-server#4829),
+  /// NULL = a legacy or keyless registration. Only the digest is stored, so the key
+  /// itself is never at rest; adoption compares digests in constant time.
+  registrationKeyHash String?  @map("registration_key_hash")
   status      ConnectionStatus @default(ACTIVE)
   /// Error message from the last permanent provider-auth failure.
   lastError   String?          @map("last_error")
