@@ -234,3 +234,47 @@ describe('GET/DELETE /connections/:id', () => {
     expect((await request(app).get(`/connections/${created.body.id}`).set(AUTH)).status).toBe(404);
   });
 });
+
+describe('a repeat DELETE answers success for a connection already deleted (#8, tool half of hadron-server#4847)', () => {
+  it('answers 200 {deleted:true} again and leaves deletedAt exactly as the first delete set it', async () => {
+    const app = createApp(db, fakeProvider(), noopForward);
+    const created = await request(app).post('/connections').set(AUTH).send({ botToken: 't-1' });
+    expect((await request(app).delete(`/connections/${created.body.id}`).set(AUTH)).body.deleted).toBe(true);
+    const first = (await db.connection.findUniqueOrThrow({ where: { id: created.body.id } })).deletedAt;
+    expect(first).not.toBeNull();
+    const again = await request(app).delete(`/connections/${created.body.id}`).set(AUTH);
+    expect(again.status).toBe(200);
+    expect(again.body).toEqual({ deleted: true });
+    expect((await db.connection.findUniqueOrThrow({ where: { id: created.body.id } })).deletedAt).toEqual(first);
+  });
+
+  it('an id the tool never held is still 404, with the same body as a GET of it', async () => {
+    const app = createApp(db, fakeProvider(), noopForward);
+    const del = await request(app).delete('/connections/never-held').set(AUTH);
+    expect(del.status).toBe(404);
+    expect(del.body).toEqual((await request(app).get('/connections/never-held').set(AUTH)).body);
+  });
+
+  it('two concurrent first DELETEs both answer success, and exactly ONE guarded write wins (the loser sees count 0)', async () => {
+    const app = createApp(db, fakeProvider(), noopForward);
+    const created = await request(app).post('/connections').set(AUTH).send({ botToken: 't-1' });
+    const original = db.connection.updateMany.bind(db.connection);
+    const counts: number[] = [];
+    const guarded = vi.spyOn(db.connection, 'updateMany').mockImplementation(((args: never) =>
+      original(args).then((r: { count: number }) => {
+        counts.push(r.count);
+        return r;
+      })) as never);
+    let results: request.Response[];
+    try {
+      results = await Promise.all(Array.from({ length: 6 }, () => request(app).delete(`/connections/${created.body.id}`).set(AUTH)));
+    } finally {
+      guarded.mockRestore();
+    }
+    const outcomes = counts.map((count) => ({ count }));
+    expect(results.map((r) => r.status)).toEqual([200, 200, 200, 200, 200, 200]);
+    expect(outcomes).toHaveLength(6);
+    expect(outcomes.filter((o) => o.count === 1)).toHaveLength(1);
+    expect(outcomes.filter((o) => o.count === 0)).toHaveLength(5);
+  });
+});
