@@ -255,14 +255,16 @@ describe('a repeat DELETE answers success for a connection already deleted (#8, 
     expect(del.body).toEqual((await request(app).get('/connections/never-held').set(AUTH)).body);
   });
 
-  it('two concurrent first DELETEs both answer success and the earlier deletedAt stands (one guarded write)', async () => {
+  it('two concurrent first DELETEs both answer success, and exactly ONE guarded write wins (the loser sees count 0)', async () => {
     const app = createApp(db, fakeProvider(), noopForward);
     const created = await request(app).post('/connections').set(AUTH).send({ botToken: 't-1' });
+    const guarded = vi.spyOn(db.connection, 'updateMany');
     const results = await Promise.all(Array.from({ length: 6 }, () => request(app).delete(`/connections/${created.body.id}`).set(AUTH)));
+    const outcomes = await Promise.all(guarded.mock.results.map((r) => r.value as Promise<{ count: number }>));
+    guarded.mockRestore();
     expect(results.map((r) => r.status)).toEqual([200, 200, 200, 200, 200, 200]);
-    const stamped = (await db.connection.findUniqueOrThrow({ where: { id: created.body.id } })).deletedAt;
-    await new Promise((r) => setTimeout(r, 20));
-    await request(app).delete(`/connections/${created.body.id}`).set(AUTH);
-    expect((await db.connection.findUniqueOrThrow({ where: { id: created.body.id } })).deletedAt).toEqual(stamped);
+    expect(outcomes).toHaveLength(6);
+    expect(outcomes.filter((o) => o.count === 1)).toHaveLength(1);
+    expect(outcomes.filter((o) => o.count === 0)).toHaveLength(5);
   });
 });
