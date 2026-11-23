@@ -127,11 +127,12 @@ describe('repairWedgedKey — complete mode', () => {
     expect(marker.repaired).toBe(true);
     expect(marker.operation).toBe('send-message');
 
-    // After the repair the key REPLAYS — no second provider mutation.
+    // After the repair the key REPLAYS — the provider (a FRESH instance that
+    // never saw the original send) is not called at all.
     const again = await runOperation(db, provider, 'send-message', sendInput(connectionId), 'k-complete');
     expect(again.replayed).toBe(true);
     expect((again.result as { repaired: boolean }).repaired).toBe(true);
-    expect(provider.calls.filter(([m]) => m === 'sendMessage')).toHaveLength(1);
+    expect(provider.calls.filter(([m]) => m === 'sendMessage')).toHaveLength(0);
   });
 
   it('is guarded: completing an already-repaired key is refused, not rewritten', async () => {
@@ -163,7 +164,8 @@ describe('repairWedgedKey — clear mode', () => {
 
     const again = await runOperation(db, provider, 'send-message', sendInput(connectionId), 'k-clear');
     expect(again.replayed).toBe(false);
-    expect(provider.calls.filter(([m]) => m === 'sendMessage')).toHaveLength(2);
+    // The fresh provider executes exactly one send — the re-execution.
+    expect(provider.calls.filter(([m]) => m === 'sendMessage')).toHaveLength(1);
   });
 });
 
