@@ -411,4 +411,59 @@ describe('lease renewal (F3 — the review delta)', () => {
     const row = await db.connection.findFirst();
     expect(row!.pollLeaseOwner).toBeNull(); // the release did land
   });
+
+  it('a release that FAILS still clears running — the connection is polled again (the swallow pin)', async () => {
+    const errors = vi.spyOn(console, 'error').mockImplementation(() => {});
+    const g = gatedProvider();
+    await seedConnection();
+    // A db double whose RENEWALS fail (the loop withdraws on its own, the row
+    // staying ours and claim-eligible) and whose RELEASE write rejects.
+    // releasePollLease must swallow that rejection — its `.catch` is the only
+    // thing keeping the awaited release in the finally from rejecting past
+    // `running.delete`. Remove the catch and the connection is stranded in
+    // `running` until process restart: never polled again.
+    const failingReleaseDb = new Proxy(db, {
+      get(target, prop, receiver) {
+        if (prop !== 'connection') return Reflect.get(target, prop, receiver);
+        return new Proxy(target.connection, {
+          get(t, p, r) {
+            if (p !== 'updateMany') return Reflect.get(t, p, r);
+            return async (args: { data?: { pollLeaseOwner?: string | null; pollLeaseExpiresAt?: unknown } }) => {
+              const data = args?.data ?? {};
+              const isRenew = data.pollLeaseOwner === undefined && 'pollLeaseExpiresAt' in data;
+              const isRelease = data.pollLeaseOwner === null;
+              if (isRenew) throw new Error('renewal db failure (injected)');
+              if (isRelease) throw new Error('release db failure (injected)');
+              return t.updateMany(args as never);
+            };
+          },
+        });
+      },
+    }) as typeof db;
+
+    g.block();
+    const w1 = startPollWorker(failingReleaseDb, g.provider, noopForward, { leaseMs: 10_000, renewMs: 50 });
+    workers.push(w1);
+    await until(() => g.getUpdatesStarted() === 1, 'worker 1 starts its loop');
+    // The renew tick (<=50 ms) fails -> leaseHeld=false, but the loop is
+    // held inside its in-flight getUpdates by the gate.
+    await new Promise((resolve) => setTimeout(resolve, 150));
+
+    g.unblock(); // the cycle completes; the loop exits into its finally,
+    // where the release write rejects and is swallowed
+    await new Promise((resolve) => setTimeout(resolve, 250));
+
+    // The failure is logged by the release's own catch, not thrown past the
+    // finally's await...
+    expect(errors.mock.calls.map(([line]) => String(line)).join('\n')).toContain('failed to release poll lease');
+    // ...so `running` was cleared and a reconcile starts a new loop (the
+    // claim is already-ours, same instance). Re-block the gate first so the
+    // new loop freezes inside its first getUpdates at exactly one more
+    // entry. With the .catch removed the awaited release rejects,
+    // running.delete never runs, and this reconcile is a no-op —
+    // getUpdatesStarted stays 1.
+    g.block();
+    await w1.reconcileNow();
+    await until(() => g.getUpdatesStarted() >= 2, 'reconcile starts a new loop after a failed release');
+  });
 });
