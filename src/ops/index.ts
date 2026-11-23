@@ -317,9 +317,12 @@ async function completeIdempotencyRecord(
   operation: string,
   result: unknown,
 ): Promise<void> {
-  const responseJson = JSON.stringify(result);
   for (let attempt = 1; attempt <= COMPLETION_ATTEMPTS; attempt++) {
     try {
+      // Serialized inside the try: a result that cannot serialize is a
+      // completion failure like any other (surfaced below), never a throw
+      // past a provider mutation that already happened.
+      const responseJson = JSON.stringify(result);
       await db.idempotencyRecord.update({ where: { key }, data: { responseJson } });
       return;
     } catch (err) {

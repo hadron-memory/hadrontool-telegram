@@ -34,40 +34,71 @@ const ERROR_BACKOFF_MS = 5_000;
 const RECONCILE_INTERVAL_MS = 15_000;
 
 /** How long a poll lease holds before another instance may claim it (#1 F3). */
-const LEASE_MS = 60_000;
+export const LEASE_MS = 60_000;
 
-/** Lease renewal cadence — comfortably inside LEASE_MS. */
-const LEASE_RENEW_MS = 20_000;
+/** Lease renewal cadence — comfortably inside LEASE_MS (pinned by relation in the lease tests). */
+export const LEASE_RENEW_MS = 20_000;
+
+/** Lease timing, injectable so the tests can exercise renewal without waiting 20 s. */
+export interface LeaseTiming {
+  leaseMs: number;
+  renewMs: number;
+}
 
 /**
  * Claim the connection's poll lease for this instance (#1 F3): a guarded
  * updateMany that succeeds only when the lease is unowned, already ours, or
  * expired — so two instances reconciling concurrently converge on one owner
  * (the row lock serializes them; the loser's WHERE no longer matches).
+ * A NULL expiry counts as claimable defense (both columns are only ever
+ * written together, so such a row is corruption or hand-edited — never a
+ * live lease worth protecting).
  */
-export async function claimPollLease(db: Db, connectionId: string, owner: string): Promise<boolean> {
+export async function claimPollLease(
+  db: Db,
+  connectionId: string,
+  owner: string,
+  leaseMs: number = LEASE_MS,
+): Promise<boolean> {
   const now = new Date();
   const res = await db.connection.updateMany({
     where: {
       id: connectionId,
-      OR: [{ pollLeaseOwner: null }, { pollLeaseOwner: owner }, { pollLeaseExpiresAt: { lt: now } }],
+      OR: [
+        { pollLeaseOwner: null },
+        { pollLeaseOwner: owner },
+        { pollLeaseExpiresAt: { lt: now } },
+        { pollLeaseExpiresAt: null },
+      ],
     },
-    data: { pollLeaseOwner: owner, pollLeaseExpiresAt: new Date(now.getTime() + LEASE_MS) },
+    data: { pollLeaseOwner: owner, pollLeaseExpiresAt: new Date(now.getTime() + leaseMs) },
   });
   return res.count === 1;
 }
 
-/** Renew our own lease (never steals a live lease held by another instance). */
-async function renewPollLease(db: Db, connectionId: string, owner: string): Promise<boolean> {
+/**
+ * Renew our own lease (never steals a live lease held by another instance —
+ * the WHERE pins the owner, pinned by its own test).
+ */
+export async function renewPollLease(
+  db: Db,
+  connectionId: string,
+  owner: string,
+  leaseMs: number = LEASE_MS,
+): Promise<boolean> {
   const res = await db.connection.updateMany({
     where: { id: connectionId, pollLeaseOwner: owner },
-    data: { pollLeaseExpiresAt: new Date(Date.now() + LEASE_MS) },
+    data: { pollLeaseExpiresAt: new Date(Date.now() + leaseMs) },
   });
   return res.count === 1;
 }
 
-/** Release the lease when our loop stops on the connection itself. */
-async function releasePollLease(db: Db, connectionId: string, owner: string): Promise<void> {
+/**
+ * Release the lease when our loop stops — guarded on still owning it, so it
+ * is a no-op after a takeover or a previous release, and a failed release
+ * only logs (the expiry is the backstop).
+ */
+export async function releasePollLease(db: Db, connectionId: string, owner: string): Promise<void> {
   await db.connection
     .updateMany({
       where: { id: connectionId, pollLeaseOwner: owner },
@@ -140,6 +171,7 @@ export async function drainOnce(
   provider: TelegramProvider,
   forward: EventForwarder,
   connectionId: string,
+  leaseOwner?: string,
 ): Promise<'ok' | 'error' | 'stopped'> {
   const connection = await db.connection.findUnique({ where: { id: connectionId } });
   if (!connection || connection.deletedAt || connection.status !== 'ACTIVE' || !connection.pollingEnabled) {
@@ -181,11 +213,27 @@ export async function drainOnce(
     }
     failures.delete(connectionId);
     // Advancing the cursor is what confirms the update to Telegram — only
-    // after durable handling (or a deliberate skip / dead-letter).
-    await db.connection.update({
-      where: { id: connectionId },
-      data: { lastUpdateId: BigInt(update.update_id) },
-    });
+    // after durable handling (or a deliberate skip / dead-letter). When the
+    // caller holds the poll lease, the write is FENCED on still owning it
+    // and on the cursor not having moved past this update: a stale loop that
+    // lost its lease (or a survivor that already advanced the cursor)
+    // confirms nothing, and stops instead.
+    if (leaseOwner) {
+      const fenced = await db.connection.updateMany({
+        where: {
+          id: connectionId,
+          pollLeaseOwner: leaseOwner,
+          lastUpdateId: { lt: BigInt(update.update_id) },
+        },
+        data: { lastUpdateId: BigInt(update.update_id) },
+      });
+      if (fenced.count === 0) return 'stopped';
+    } else {
+      await db.connection.update({
+        where: { id: connectionId },
+        data: { lastUpdateId: BigInt(update.update_id) },
+      });
+    }
   }
   return 'ok';
 }
@@ -205,12 +253,16 @@ function sleep(ms: number): Promise<void> {
  * connection's poll lease, the loop renews it on its own timer, and a dead
  * instance's lease expires (LEASE_MS) for a survivor to claim. Without this,
  * scale-out or an overlapping rolling deploy ran competing getUpdates loops
- * and Telegram answered the second long poll with a 409.
+ * and Telegram answered the second long poll with a 409. In-process,
+ * reconciles are serialized (the claim sequence straddles an await) and the
+ * cursor write is fenced on lease ownership, so a loop that lost its lease
+ * confirms nothing to Telegram.
  */
 export function startPollWorker(
   db: Db,
   provider: TelegramProvider,
   forward: EventForwarder,
+  timing: LeaseTiming = { leaseMs: LEASE_MS, renewMs: LEASE_RENEW_MS },
 ): { stop: () => void; reconcileNow: () => Promise<void> } {
   const running = new Set<string>();
   let stopped = false;
@@ -220,43 +272,49 @@ export function startPollWorker(
   async function loop(connectionId: string): Promise<void> {
     let leaseHeld = true;
     // Renew independently of cycle time: a slow batch (or a long poll) must
-    // not let the lease lapse and hand the loop to another instance.
+    // not let the lease lapse and hand the loop to another instance. A
+    // renewal we cannot confirm — answered "not ours" OR failed — withdraws
+    // the loop: better a 15 s reconcile gap than two pollers on one bot.
     const renewTimer = setInterval(() => {
-      void renewPollLease(db, connectionId, instanceId)
+      void renewPollLease(db, connectionId, instanceId, timing.leaseMs)
         .then((renewed) => {
           if (!renewed) {
             leaseHeld = false;
             logInfo(`poll lease for connection ${connectionId} no longer ours — stopping the loop`);
           }
         })
-        .catch((err) => logError(`poll lease renewal failed for connection ${connectionId}`, err));
-    }, LEASE_RENEW_MS);
+        .catch((err) => {
+          leaseHeld = false;
+          logError(`poll lease renewal failed for connection ${connectionId} — stopping the loop`, err);
+        });
+    }, timing.renewMs);
     renewTimer.unref();
     try {
       while (!stopped && leaseHeld) {
         let outcome: 'ok' | 'error' | 'stopped';
         try {
-          outcome = await drainOnce(db, provider, forward, connectionId);
+          outcome = await drainOnce(db, provider, forward, connectionId, instanceId);
         } catch (err) {
           logError(`drain cycle crashed for connection ${connectionId}`, err);
           outcome = 'error';
         }
-        if (outcome === 'stopped') {
-          // The connection itself ended the loop — free the lease at once
-          // instead of making a survivor wait out the expiry.
-          await releasePollLease(db, connectionId, instanceId);
-          break;
-        }
+        if (outcome === 'stopped') break;
         // 'ok' cycles back immediately — getUpdates itself long-polls.
         if (outcome === 'error') await sleep(ERROR_BACKOFF_MS);
       }
     } finally {
       clearInterval(renewTimer);
       running.delete(connectionId);
+      // Any graceful exit (stop(), the connection ending, the lease lost)
+      // frees the lease now instead of making a successor wait out the
+      // expiry. Crash semantics are unchanged — a killed process runs no
+      // finally, and the expiry stays the backstop. Guarded on still owning
+      // it, so after a takeover this is a no-op.
+      await releasePollLease(db, connectionId, instanceId);
     }
   }
 
-  async function reconcile(): Promise<void> {
+  async function doReconcile(): Promise<void> {
     const connections = await db.connection.findMany({
       where: { deletedAt: null, status: 'ACTIVE', pollingEnabled: true },
       select: { id: true },
@@ -265,7 +323,7 @@ export function startPollWorker(
       if (running.has(id)) continue;
       let claimed = false;
       try {
-        claimed = await claimPollLease(db, id, instanceId);
+        claimed = await claimPollLease(db, id, instanceId, timing.leaseMs);
       } catch (err) {
         logError(`poll lease claim failed for connection ${id}`, err);
         continue;
@@ -276,10 +334,25 @@ export function startPollWorker(
     }
   }
 
+  // Serialize reconciles in-process: the running.has → claim → running.add
+  // sequence straddles an await, so two overlapping reconciles would both
+  // claim (already-ours) and both start loops for one connection. A tick
+  // that lands while a reconcile is in flight joins it instead of racing it.
+  let reconcileInFlight: Promise<void> | null = null;
+  function reconcile(): Promise<void> {
+    if (reconcileInFlight) return reconcileInFlight;
+    reconcileInFlight = doReconcile()
+      .catch((err) => logError('poll reconciler failed', err))
+      .finally(() => {
+        reconcileInFlight = null;
+      });
+    return reconcileInFlight;
+  }
+
   const timer = setInterval(() => {
-    void reconcile().catch((err) => logError('poll reconciler failed', err));
+    void reconcile();
   }, RECONCILE_INTERVAL_MS);
-  void reconcile().catch((err) => logError('poll reconciler failed', err));
+  void reconcile();
   logInfo('poll worker started');
 
   return {
@@ -288,9 +361,6 @@ export function startPollWorker(
       clearInterval(timer);
     },
     /** Run one reconcile immediately (also the test handle for lease tests). */
-    reconcileNow: () =>
-      reconcile().catch((err) => {
-        logError('poll reconciler failed', err);
-      }),
+    reconcileNow: () => reconcile(),
   };
 }

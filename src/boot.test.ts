@@ -29,8 +29,9 @@ const PRODUCTION = {
   NODE_ENV: 'production',
   TELEGRAM_TOOL_TOKEN: 'test-tool-token',
   TOKEN_ENCRYPTION_KEY: '00112233445566778899aabbccddeeff00112233445566778899aabbccddeeff',
-  // A syntactically valid URL nobody connects to — the probe never queries.
-  DATABASE_URL: 'postgresql://holger@localhost:5432/hadrontool_telegram_test',
+  // A syntactically valid URL nobody connects to — the probe never queries,
+  // so it deliberately names no real user or database.
+  DATABASE_URL: 'postgresql://probe@localhost:5432/probe',
   CORE_EVENTS_URL: 'http://hadron-server:4000/internal/telegram-events',
 };
 
@@ -50,33 +51,57 @@ async function boot(env: Record<string, string>): Promise<{ ok: boolean; out: st
 }
 
 describe('production boot refusals', () => {
-  it('F1: refuses to boot in production with the poll worker enabled and CORE_EVENTS_URL unset', async () => {
-    const r = await boot({ ...PRODUCTION, CORE_EVENTS_URL: '' });
-    expect(r.ok).toBe(false);
-    expect(r.out).toMatch(/CORE_EVENTS_URL/);
-  });
+  // Each case spawns a real child process over tsx — allow well over the
+  // 5 s default so a slow CI host cannot flake these.
+  const SLOW = 20_000;
 
-  it('F1: an ops-only production instance (DISABLE_POLL_WORKER=true) boots without CORE_EVENTS_URL', async () => {
-    const r = await boot({ ...PRODUCTION, CORE_EVENTS_URL: '', DISABLE_POLL_WORKER: 'true' });
-    expect(r.ok).toBe(true);
-    expect(r.out).toContain('BOOT_OK');
-  });
+  it(
+    'F1: refuses to boot in production with the poll worker enabled and CORE_EVENTS_URL unset',
+    async () => {
+      const r = await boot({ ...PRODUCTION, CORE_EVENTS_URL: '' });
+      expect(r.ok).toBe(false);
+      expect(r.out).toMatch(/CORE_EVENTS_URL is required in production/);
+    },
+    SLOW,
+  );
 
-  it('F1: development keeps drop-mode — no CORE_EVENTS_URL still boots', async () => {
-    const r = await boot({ ...PRODUCTION, NODE_ENV: 'development', CORE_EVENTS_URL: '' });
-    expect(r.ok).toBe(true);
-    expect(r.out).toContain('BOOT_OK');
-  });
+  it(
+    'F1: an ops-only production instance (DISABLE_POLL_WORKER=true) boots without CORE_EVENTS_URL',
+    async () => {
+      const r = await boot({ ...PRODUCTION, CORE_EVENTS_URL: '', DISABLE_POLL_WORKER: 'true' });
+      expect(r.ok).toBe(true);
+      expect(r.out).toContain('BOOT_OK');
+    },
+    SLOW,
+  );
 
-  it('F5: refuses to boot in production without DATABASE_URL', async () => {
-    const r = await boot({ ...PRODUCTION, DATABASE_URL: '' });
-    expect(r.ok).toBe(false);
-    expect(r.out).toMatch(/DATABASE_URL/);
-  });
+  it(
+    'F1: development keeps drop-mode — no CORE_EVENTS_URL still boots',
+    async () => {
+      const r = await boot({ ...PRODUCTION, NODE_ENV: 'development', CORE_EVENTS_URL: '' });
+      expect(r.ok).toBe(true);
+      expect(r.out).toContain('BOOT_OK');
+    },
+    SLOW,
+  );
 
-  it('a fully configured production boot succeeds', async () => {
-    const r = await boot({ ...PRODUCTION });
-    expect(r.ok).toBe(true);
-    expect(r.out).toContain('BOOT_OK');
-  });
+  it(
+    'F5: refuses to boot in production without DATABASE_URL',
+    async () => {
+      const r = await boot({ ...PRODUCTION, DATABASE_URL: '' });
+      expect(r.ok).toBe(false);
+      expect(r.out).toMatch(/DATABASE_URL is required in production/);
+    },
+    SLOW,
+  );
+
+  it(
+    'a fully configured production boot succeeds',
+    async () => {
+      const r = await boot({ ...PRODUCTION });
+      expect(r.ok).toBe(true);
+      expect(r.out).toContain('BOOT_OK');
+    },
+    SLOW,
+  );
 });
