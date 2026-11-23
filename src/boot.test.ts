@@ -96,6 +96,16 @@ describe('production boot refusals', () => {
   );
 
   it(
+    'F5: refuses to boot in production with a whitespace-only DATABASE_URL (unset for the guard)',
+    async () => {
+      const r = await boot({ ...PRODUCTION, DATABASE_URL: '   ' });
+      expect(r.ok).toBe(false);
+      expect(r.out).toMatch(/DATABASE_URL is required in production/);
+    },
+    SLOW,
+  );
+
+  it(
     'a fully configured production boot succeeds',
     async () => {
       const r = await boot({ ...PRODUCTION });

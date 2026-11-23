@@ -163,8 +163,11 @@ export function eventForUpdate(connectionId: string, update: TgUpdate): Telegram
 /**
  * One drain cycle for one connection: fetch a batch from the current cursor
  * and process it in order. Returns 'stopped' when the loop should end (the
- * connection is gone, disabled, or its token died), 'error' for a transient
- * failure (back off, retry), 'ok' otherwise.
+ * connection is gone, disabled, or its token died — or, when leaseOwner is
+ * passed, the fenced cursor write found the lease lost or the cursor already
+ * past the update), 'error' for a transient failure (back off, retry), 'ok'
+ * otherwise. The unfenced else-branch exists for non-leased callers only
+ * (direct use and the tests); the poll worker always passes its lease owner.
  */
 export async function drainOnce(
   db: Db,
@@ -227,7 +230,21 @@ export async function drainOnce(
         },
         data: { lastUpdateId: BigInt(update.update_id) },
       });
-      if (fenced.count === 0) return 'stopped';
+      if (fenced.count === 0) {
+        // Which guard refused matters to the operator reading the log: a
+        // lost lease is a takeover, a cursor already past is a successor
+        // that got there first. One read on this rare path buys the answer.
+        const row = await db.connection.findUnique({
+          where: { id: connectionId },
+          select: { pollLeaseOwner: true, lastUpdateId: true },
+        });
+        const cause = row?.pollLeaseOwner !== leaseOwner ? 'lease no longer ours' : 'cursor already past this update';
+        logInfo(
+          `fenced cursor write refused for connection ${connectionId} update ${update.update_id} ` +
+            `(cursor ${row?.lastUpdateId ?? 'gone'}): ${cause}`,
+        );
+        return 'stopped';
+      }
     } else {
       await db.connection.update({
         where: { id: connectionId },
@@ -304,13 +321,17 @@ export function startPollWorker(
       }
     } finally {
       clearInterval(renewTimer);
-      running.delete(connectionId);
-      // Any graceful exit (stop(), the connection ending, the lease lost)
-      // frees the lease now instead of making a successor wait out the
-      // expiry. Crash semantics are unchanged — a killed process runs no
-      // finally, and the expiry stays the backstop. Guarded on still owning
-      // it, so after a takeover this is a no-op.
+      // Release BEFORE clearing `running`: the release is awaited, so a
+      // reconcile landing in that window would otherwise see the connection
+      // as not-running, re-claim the still-held lease (already-ours) and
+      // start a new loop — whose lease this release then clears underneath
+      // it, leaving an unowned poller (or two, cross-instance). Ordering the
+      // delete last keeps the whole release window covered by `running`.
+      // Crash semantics are unchanged — a killed process runs no finally,
+      // and the expiry stays the backstop. The release is guarded on still
+      // owning it, so after a takeover this is a no-op.
       await releasePollLease(db, connectionId, instanceId);
+      running.delete(connectionId);
     }
   }
 

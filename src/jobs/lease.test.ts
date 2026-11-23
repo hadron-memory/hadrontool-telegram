@@ -11,14 +11,20 @@
  * most one getUpdates call per connection is ever in flight, and after the
  * holder dies the lease converges to the survivor.
  */
-import { afterAll, afterEach, beforeEach, describe, expect, it } from 'vitest';
+import { afterAll, afterEach, beforeEach, describe, expect, it, vi } from 'vitest';
 import { encryptToken } from '../crypto.js';
 import { db } from '../db.js';
 import type { Db } from '../db.js';
+import type { EventForwarder } from '../events/forwarder.js';
 import type { TgUpdate } from '../providers/botapi/types.js';
 import type { TelegramProvider } from '../providers/botapi/types.js';
 import { fakeProvider, resetDb, tgMessage, updatesFrom } from '../test/fakes.js';
-import { claimPollLease, LEASE_MS, LEASE_RENEW_MS, renewPollLease, startPollWorker } from './poller.js';
+import { claimPollLease, drainOnce, LEASE_MS, LEASE_RENEW_MS, renewPollLease, startPollWorker } from './poller.js';
+
+/** Silence the poller's info lines for one test and keep them assertable. */
+function captureInfoLines() {
+  return vi.spyOn(console, 'log').mockImplementation(() => {});
+}
 
 /** Seed one ACTIVE, polling connection; returns its id. */
 async function seedConnection(): Promise<string> {
@@ -93,6 +99,7 @@ beforeEach(async () => {
 
 afterEach(() => {
   for (const w of workers) w.stop();
+  vi.restoreAllMocks();
 });
 
 afterAll(async () => {
@@ -299,7 +306,33 @@ describe('lease renewal (F3 — the review delta)', () => {
     expect(row!.pollLeaseOwner).toBe('instance-a');
   });
 
+  it('the fenced cursor write never moves the cursor backward, even for the owner', async () => {
+    const logs = captureInfoLines();
+    const g = gatedProvider();
+    const connectionId = await seedConnection();
+    g.pendingUpdates(updatesFrom(500, tgMessage({ message_id: 500, text: 'stale' })));
+    expect(await claimPollLease(db, connectionId, 'owner-a')).toBe(true);
+    // The batch is fetched from behind the cursor; while it is in hand the
+    // cursor is confirmed past it under the SAME owner — the one case the
+    // lease clause cannot see (one instance, two loops: the race the mutex
+    // and the release order close, with this fence as the backstop).
+    const forward: EventForwarder = async () => {
+      await db.connection.update({ where: { id: connectionId }, data: { lastUpdateId: 900n } });
+      return true;
+    };
+
+    const outcome = await drainOnce(db, g.provider, forward, connectionId, 'owner-a');
+
+    expect(outcome).toBe('stopped');
+    const row = await db.connection.findUnique({ where: { id: connectionId } });
+    expect(row!.lastUpdateId).toBe(900n); // not dragged back to 500
+    // The refusal names the guard that refused: a successor that got there
+    // first, not a takeover.
+    expect(logs.mock.calls.map(([line]) => String(line)).join('\n')).toContain('cursor already past this update');
+  });
+
   it('the fenced cursor write: a stale owner confirms nothing and stops', async () => {
+    const logs = captureInfoLines();
     const g = gatedProvider();
     const connectionId = await seedConnection();
 
@@ -322,5 +355,60 @@ describe('lease renewal (F3 — the review delta)', () => {
     const row = await db.connection.findUnique({ where: { id: connectionId } });
     expect(row!.lastUpdateId).toBe(0n);
     expect(g.maxInFlight()).toBe(1);
+    // And the refusal names its cause: a takeover, not a cursor already past.
+    expect(logs.mock.calls.map(([line]) => String(line)).join('\n')).toContain('lease no longer ours');
+  });
+
+  it('the loop releases its lease BEFORE clearing running — no re-claim race in the exit window', async () => {
+    const g = gatedProvider();
+    await seedConnection();
+    let releaseInFlight = false;
+    // A db double that makes RENEWALS fail (so the loop withdraws without
+    // the worker being stopped — the row stays ACTIVE, ours, claim-eligible)
+    // and delays the RELEASE write, opening an observable race window.
+    const raceDb = new Proxy(db, {
+      get(target, prop, receiver) {
+        if (prop !== 'connection') return Reflect.get(target, prop, receiver);
+        return new Proxy(target.connection, {
+          get(t, p, r) {
+            if (p !== 'updateMany') return Reflect.get(t, p, r);
+            return async (args: { data?: { pollLeaseOwner?: string | null; pollLeaseExpiresAt?: unknown } }) => {
+              const data = args?.data ?? {};
+              const isRenew = data.pollLeaseOwner === undefined && 'pollLeaseExpiresAt' in data;
+              const isRelease = data.pollLeaseOwner === null;
+              if (isRenew) throw new Error('renewal db failure (injected)');
+              if (!isRelease) return t.updateMany(args as never);
+              releaseInFlight = true;
+              try {
+                await new Promise((resolve) => setTimeout(resolve, 150));
+                return await t.updateMany(args as never);
+              } finally {
+                releaseInFlight = false;
+              }
+            };
+          },
+        });
+      },
+    }) as typeof db;
+
+    g.block();
+    const w1 = startPollWorker(raceDb, g.provider, noopForward, { leaseMs: 10_000, renewMs: 50 });
+    workers.push(w1);
+    await until(() => g.getUpdatesStarted() === 1, 'worker 1 starts its loop');
+    // The renew tick (<=50 ms) fails -> leaseHeld=false, but the loop is
+    // held inside its in-flight getUpdates by the gate.
+    await new Promise((resolve) => setTimeout(resolve, 150));
+
+    g.unblock(); // the cycle completes; the loop exits into its finally
+    await until(() => releaseInFlight, 'the release write is in flight');
+    // A reconcile landing INSIDE the release window must not start a second
+    // loop: with running cleared before the awaited release, it re-claims
+    // the still-held lease and starts a poller whose lease this release
+    // then clears underneath it.
+    await w1.reconcileNow();
+    await new Promise((resolve) => setTimeout(resolve, 250));
+    expect(g.getUpdatesStarted()).toBe(1);
+    const row = await db.connection.findFirst();
+    expect(row!.pollLeaseOwner).toBeNull(); // the release did land
   });
 });
