@@ -234,3 +234,35 @@ describe('GET/DELETE /connections/:id', () => {
     expect((await request(app).get(`/connections/${created.body.id}`).set(AUTH)).status).toBe(404);
   });
 });
+
+describe('a repeat DELETE answers success for a connection already deleted (#8, tool half of hadron-server#4847)', () => {
+  it('answers 200 {deleted:true} again and leaves deletedAt exactly as the first delete set it', async () => {
+    const app = createApp(db, fakeProvider(), noopForward);
+    const created = await request(app).post('/connections').set(AUTH).send({ botToken: 't-1' });
+    expect((await request(app).delete(`/connections/${created.body.id}`).set(AUTH)).body.deleted).toBe(true);
+    const first = (await db.connection.findUniqueOrThrow({ where: { id: created.body.id } })).deletedAt;
+    expect(first).not.toBeNull();
+    const again = await request(app).delete(`/connections/${created.body.id}`).set(AUTH);
+    expect(again.status).toBe(200);
+    expect(again.body).toEqual({ deleted: true });
+    expect((await db.connection.findUniqueOrThrow({ where: { id: created.body.id } })).deletedAt).toEqual(first);
+  });
+
+  it('an id the tool never held is still 404, with the same body as a GET of it', async () => {
+    const app = createApp(db, fakeProvider(), noopForward);
+    const del = await request(app).delete('/connections/never-held').set(AUTH);
+    expect(del.status).toBe(404);
+    expect(del.body).toEqual((await request(app).get('/connections/never-held').set(AUTH)).body);
+  });
+
+  it('two concurrent first DELETEs both answer success and the earlier deletedAt stands (one guarded write)', async () => {
+    const app = createApp(db, fakeProvider(), noopForward);
+    const created = await request(app).post('/connections').set(AUTH).send({ botToken: 't-1' });
+    const results = await Promise.all(Array.from({ length: 6 }, () => request(app).delete(`/connections/${created.body.id}`).set(AUTH)));
+    expect(results.map((r) => r.status)).toEqual([200, 200, 200, 200, 200, 200]);
+    const stamped = (await db.connection.findUniqueOrThrow({ where: { id: created.body.id } })).deletedAt;
+    await new Promise((r) => setTimeout(r, 20));
+    await request(app).delete(`/connections/${created.body.id}`).set(AUTH);
+    expect((await db.connection.findUniqueOrThrow({ where: { id: created.body.id } })).deletedAt).toEqual(stamped);
+  });
+});

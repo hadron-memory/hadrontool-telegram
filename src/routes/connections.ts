@@ -151,12 +151,17 @@ export function connectionsRouter(db: Db, provider: TelegramProvider): Router {
     }
   });
 
-  // Disconnect: soft-delete; the poll loop stops itself on its next cycle.
+  // Disconnect: soft-delete; the poll loop stops itself on its next cycle. A REPEAT delete of a connection this tool held is a
+  // success (core's durable teardown retries until it hears one, hadron-server#4847, cor:int:030:03 clause 3); an id the tool
+  // NEVER held stays 404. The soft-delete is ONE guarded write (only where deletedAt is still null), so two concurrent first
+  // deletes cannot overwrite each other's deletedAt; a count of 0 then looks the row up to tell already-deleted from never-held.
+  // A future purge of old rows must keep a tombstone for the id, or a repeat delete after the purge would read as never-held.
   router.delete('/:id', async (req, res) => {
     try {
-      const connection = await db.connection.findUnique({ where: { id: req.params.id } });
-      if (!connection || connection.deletedAt) throw new ConnectionNotFoundError();
-      await db.connection.update({ where: { id: connection.id }, data: { deletedAt: new Date() } });
+      const { count } = await db.connection.updateMany({ where: { id: req.params.id, deletedAt: null }, data: { deletedAt: new Date() } });
+      if (count === 0 && !(await db.connection.findUnique({ where: { id: req.params.id }, select: { id: true } }))) {
+        throw new ConnectionNotFoundError();
+      }
       res.json({ deleted: true });
     } catch (err) {
       respondWithError(res, err, 'delete connection');
