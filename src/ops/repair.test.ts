@@ -90,13 +90,27 @@ function withCompletionBetweenReadAndWrite(realDb: Db): Db {
 }
 
 /**
- * A db stand-in that deletes the row and RE-RESERVES the same key (new
- * requestHash, fresh createdAt, no response) between repairWedgedKey's read
- * and its first guarded write. Pins the row-identity pin in the where clause
- * (BLIND F1): {key, responseJson: null} alone would match the new live
- * reservation — complete would write the marker over it, clear would delete it.
+ * A db stand-in that deletes the row and RE-RESERVES the same key (no
+ * response) between repairWedgedKey's read and its first guarded write. Pins
+ * the row-identity terms in the where clause (BLIND F1): {key, responseJson:
+ * null} alone would match the new live reservation — complete would write the
+ * marker over it, clear would delete it.
+ *
+ * Which term separates the re-reservation from the judged row is the point
+ * (local-delta P2). `requestHash: 'original'` re-reserves with the SAME hash
+ * and a fresh createdAt — the realistic same-key same-PAYLOAD retry, where
+ * only the createdAt term can refuse the write (a guard without createdAt
+ * clobbers the live reservation). `createdAt: 'original'` is the mirror: a
+ * different hash reusing the judged row's createdAt, where only the
+ * requestHash term refuses it. The default (both fresh) is the realistic
+ * different-payload retry, which either term catches.
  */
-function withResurrectionBetweenReadAndWrite(realDb: Db): Db {
+function withResurrectionBetweenReadAndWrite(
+  realDb: Db,
+  opts: { requestHash?: 'original' | 'fresh'; createdAt?: 'original' | 'fresh' } = {},
+): Db {
+  const hashMode = opts.requestHash ?? 'fresh';
+  const createdMode = opts.createdAt ?? 'fresh';
   return new Proxy(realDb, {
     get(target, prop, receiver) {
       if (prop !== 'idempotencyRecord') return Reflect.get(target, prop, receiver);
@@ -109,14 +123,15 @@ function withResurrectionBetweenReadAndWrite(realDb: Db): Db {
           return async (arg: { where: { key: string } }) => {
             if (!injected) {
               injected = true;
+              const judged = await realDb.idempotencyRecord.findUnique({ where: { key: arg.where.key } });
               await realDb.idempotencyRecord.delete({ where: { key: arg.where.key } });
               await realDb.idempotencyRecord.create({
                 data: {
                   key: arg.where.key,
                   operation: 'send-message',
-                  requestHash: 're-reserved',
+                  requestHash: hashMode === 'original' ? judged!.requestHash : 're-reserved',
                   responseJson: null,
-                  createdAt: new Date(),
+                  createdAt: createdMode === 'original' ? judged!.createdAt : new Date(),
                 },
               });
             }
@@ -306,36 +321,66 @@ describe('repairWedgedKey — interlocks', () => {
     expect(afterClear!.responseJson).toBe('{"message":{"concurrentWinner":true}}');
   });
 
-  it('row-identity pin: a key deleted and re-reserved between the read and the write is not clobbered, both modes (BLIND F1)', async () => {
-    // Complete mode: the fresh reservation must stay response-less — no marker over it.
-    await db.idempotencyRecord.create({
-      data: { key: 'k-reres-complete', operation: 'send-message', requestHash: 'a', responseJson: null, createdAt: new Date(Date.now() - 30 * 60_000) },
-    });
-    const completed = await repairWedgedKey(withResurrectionBetweenReadAndWrite(db), 'k-reres-complete', {
-      mode: 'complete',
-      confirm: true,
-      minAgeMinutes: 0,
-    });
-    expect(completed.status).toBe('refused');
-    // The row that now exists is a NEW live reservation, not a completion.
-    expect(completed.refusal).toBe('too-young');
-    const afterComplete = await db.idempotencyRecord.findUnique({ where: { key: 'k-reres-complete' } });
-    expect(afterComplete!.responseJson).toBeNull();
-    expect(afterComplete!.requestHash).toBe('re-reserved');
+  it('row-identity pin: a key deleted and re-reserved between the read and the write is not clobbered, every retry shape, both modes (BLIND F1 + local-delta P2)', async () => {
+    // Each shape leaves exactly ONE guard term separating the new live
+    // reservation from the judged row, so dropping that term from the where
+    // clause clobbers the reservation and this pin goes red:
+    //  - same-payload retry (original requestHash, fresh createdAt) — the
+    //    realistic same-key retry; only createdAt refuses the write,
+    //  - same-createdAt (fresh requestHash, original createdAt) — only
+    //    requestHash refuses the write,
+    //  - both fresh — the different-payload retry; either term refuses it.
+    const shapes = [
+      { label: 'same-payload retry', requestHash: 'original', createdAt: 'fresh' },
+      { label: 'same-createdAt', requestHash: 'fresh', createdAt: 'original' },
+      { label: 'both fresh', requestHash: 'fresh', createdAt: 'fresh' },
+    ] as const;
 
-    // Clear mode: the fresh reservation must survive the delete.
-    await db.idempotencyRecord.create({
-      data: { key: 'k-reres-clear', operation: 'send-message', requestHash: 'b', responseJson: null, createdAt: new Date(Date.now() - 30 * 60_000) },
-    });
-    const cleared = await repairWedgedKey(withResurrectionBetweenReadAndWrite(db), 'k-reres-clear', {
-      mode: 'clear',
-      confirm: true,
-      minAgeMinutes: 0,
-    });
-    expect(cleared.status).toBe('refused');
-    expect(cleared.refusal).toBe('too-young');
-    const afterClear = await db.idempotencyRecord.findUnique({ where: { key: 'k-reres-clear' } });
-    expect(afterClear!.responseJson).toBeNull();
-    expect(afterClear!.requestHash).toBe('re-reserved');
+    for (const [i, shape] of shapes.entries()) {
+      const suffix = `-${i}`;
+      const seedAge = new Date(Date.now() - 30 * 60_000);
+
+      // Complete mode: the fresh reservation must stay response-less — no marker over it.
+      await db.idempotencyRecord.create({
+        data: { key: `k-reres${suffix}-complete`, operation: 'send-message', requestHash: 'a', responseJson: null, createdAt: seedAge },
+      });
+      const completed = await repairWedgedKey(withResurrectionBetweenReadAndWrite(db, shape), `k-reres${suffix}-complete`, {
+        mode: 'complete',
+        confirm: true,
+        minAgeMinutes: 0,
+      });
+      expect(completed.status, `${shape.label}: complete`).toBe('refused');
+      // The row that now exists is a NEW live reservation, not a completion.
+      expect(completed.refusal, `${shape.label}: complete refusal`).toBe('too-young');
+      const afterComplete = await db.idempotencyRecord.findUnique({ where: { key: `k-reres${suffix}-complete` } });
+      expect(afterComplete!.responseJson, `${shape.label}: no marker over the live reservation`).toBeNull();
+      // …and it is the re-reservation, not the judged row.
+      if (shape.createdAt === 'fresh') {
+        expect(afterComplete!.createdAt.getTime(), `${shape.label}: complete row is the re-reservation`).toBeGreaterThan(seedAge.getTime());
+      }
+      if (shape.requestHash === 'fresh') {
+        expect(afterComplete!.requestHash, `${shape.label}: complete row is the re-reservation`).toBe('re-reserved');
+      }
+
+      // Clear mode: the fresh reservation must survive the delete.
+      await db.idempotencyRecord.create({
+        data: { key: `k-reres${suffix}-clear`, operation: 'send-message', requestHash: 'b', responseJson: null, createdAt: seedAge },
+      });
+      const cleared = await repairWedgedKey(withResurrectionBetweenReadAndWrite(db, shape), `k-reres${suffix}-clear`, {
+        mode: 'clear',
+        confirm: true,
+        minAgeMinutes: 0,
+      });
+      expect(cleared.status, `${shape.label}: clear`).toBe('refused');
+      expect(cleared.refusal, `${shape.label}: clear refusal`).toBe('too-young');
+      const afterClear = await db.idempotencyRecord.findUnique({ where: { key: `k-reres${suffix}-clear` } });
+      expect(afterClear!.responseJson, `${shape.label}: the live reservation survived the delete`).toBeNull();
+      if (shape.createdAt === 'fresh') {
+        expect(afterClear!.createdAt.getTime(), `${shape.label}: clear row is the re-reservation`).toBeGreaterThan(seedAge.getTime());
+      }
+      if (shape.requestHash === 'fresh') {
+        expect(afterClear!.requestHash, `${shape.label}: clear row is the re-reservation`).toBe('re-reserved');
+      }
+    }
   });
 });
