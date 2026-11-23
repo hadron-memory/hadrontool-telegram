@@ -36,6 +36,10 @@ interface Args {
   olderThanMinutes: number;
   minAgeMinutes: number;
   limit: number;
+  /** Which tuning flags were EXPLICITLY passed — a flag tuned for the other mode is a usage error, not a silent no-op (QA F2). */
+  sawOlderThan: boolean;
+  sawMinAge: boolean;
+  sawLimit: boolean;
 }
 
 function parseArgs(argv: string[]): Args {
@@ -47,6 +51,9 @@ function parseArgs(argv: string[]): Args {
     olderThanMinutes: DEFAULT_WEDGED_MIN_AGE_MINUTES,
     minAgeMinutes: DEFAULT_WEDGED_MIN_AGE_MINUTES,
     limit: DEFAULT_LIST_LIMIT,
+    sawOlderThan: false,
+    sawMinAge: false,
+    sawLimit: false,
   };
   for (let i = 0; i < argv.length; i++) {
     const a = argv[i]!;
@@ -74,9 +81,16 @@ function parseArgs(argv: string[]): Args {
         if (raw === undefined || !Number.isFinite(n) || n <= 0) {
           throw new UsageError(`${a} needs a positive number, got ${JSON.stringify(raw)}`);
         }
-        if (a === '--limit') args.limit = Math.floor(n);
-        else if (a === '--older-than-minutes') args.olderThanMinutes = n;
-        else args.minAgeMinutes = Math.max(MIN_AGE_FLOOR_MINUTES, n);
+        if (a === '--limit') {
+          args.limit = Math.floor(n);
+          args.sawLimit = true;
+        } else if (a === '--older-than-minutes') {
+          args.olderThanMinutes = n;
+          args.sawOlderThan = true;
+        } else {
+          args.minAgeMinutes = Math.max(MIN_AGE_FLOOR_MINUTES, n);
+          args.sawMinAge = true;
+        }
         break;
       }
       default:
@@ -106,7 +120,7 @@ async function main(): Promise<void> {
   const args = parseArgs(process.argv.slice(2));
 
   if (args.list) {
-    if (args.key || args.complete || args.clear || args.yes) usage();
+    if (args.key || args.complete || args.clear || args.yes || args.sawMinAge) usage();
     const rows = await listWedgedKeys(db, { olderThanMinutes: args.olderThanMinutes, limit: args.limit });
     if (rows.length === 0) {
       console.log(`no wedged keys (NULL response older than ${args.olderThanMinutes} min)`);
@@ -118,7 +132,7 @@ async function main(): Promise<void> {
     return;
   }
 
-  if (!args.key || (args.complete === args.clear)) usage();
+  if (!args.key || (args.complete === args.clear) || args.sawOlderThan || args.sawLimit) usage();
   const mode = args.complete ? 'complete' : 'clear';
 
   const outcome = await repairWedgedKey(db, args.key, {
@@ -129,7 +143,11 @@ async function main(): Promise<void> {
 
   switch (outcome.status) {
     case 'refused':
-      printRow('refused:', outcome.row ?? { key: args.key, operation: '?', createdAt: new Date(NaN), responseJson: null });
+      // Only not-found arrives without a row (the other refusals carry one);
+      // say so plainly instead of printing a phantom row (no NaN age, no
+      // wedged/in-flight claim for a key that has no record).
+      if (outcome.row) printRow('refused:', outcome.row);
+      else console.log(`refused: key=${args.key} — no idempotency record with this key`);
       console.log(`  refusal: ${outcome.refusal} — nothing written`);
       process.exitCode = 4;
       return;
@@ -138,6 +156,10 @@ async function main(): Promise<void> {
       console.log(`  planned: ${outcome.plan}`);
       if (outcome.duplicateSendRisk) {
         console.log('  WARNING duplicate-send risk: clearing lets the next same-key request re-execute the operation.');
+      }
+      if (outcome.mode === 'complete') {
+        console.log('  WARNING fabricated-success risk: completing makes every future same-key retry replay success');
+        console.log('  without re-sending — if the mutation never actually happened, the operation never runs.');
       }
       console.log('  confirm against the tool log: an `idempotency completion failed for key` line means the provider');
       console.log('  mutation SUCCEEDED (prefer --complete); no line means crash-or-op-failure (--clear is the retry semantics).');
@@ -159,7 +181,11 @@ async function main(): Promise<void> {
 main()
   .catch((err) => {
     if (err instanceof UsageError) {
+      // usage() already printed the usage block (and set exitCode 2);
+      // parseArgs' errors (unknown argument, bad number) did not — print the
+      // message, and in every case leave exit code 2 as the header documents.
       if (process.exitCode !== 2) console.error(String(err.message));
+      process.exitCode = 2;
       return;
     }
     console.error('repair failed:', err);

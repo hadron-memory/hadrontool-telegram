@@ -56,6 +56,78 @@ function withWedgingCompletion(realDb: Db): Db {
   }) as Db;
 }
 
+/**
+ * A db stand-in that lands a REAL completion between repairWedgedKey's read
+ * and its first guarded write: the first updateMany/deleteMany call first
+ * stores a response on the row (the concurrent winner), then delegates.
+ * Pins the responseJson:null write guard (LOCAL F1): without it the guarded
+ * write matches the now-completed row and clobbers it.
+ */
+function withCompletionBetweenReadAndWrite(realDb: Db): Db {
+  return new Proxy(realDb, {
+    get(target, prop, receiver) {
+      if (prop !== 'idempotencyRecord') return Reflect.get(target, prop, receiver);
+      const model = Reflect.get(target, prop, receiver) as object;
+      let injected = false;
+      return new Proxy(model, {
+        get(m, mProp, mReceiver) {
+          if (mProp !== 'updateMany' && mProp !== 'deleteMany') return Reflect.get(m, mProp, mReceiver);
+          const orig = Reflect.get(m, mProp, mReceiver) as (arg: { where: { key: string } }) => Promise<unknown>;
+          return async (arg: { where: { key: string } }) => {
+            if (!injected) {
+              injected = true;
+              await realDb.idempotencyRecord.update({
+                where: { key: arg.where.key },
+                data: { responseJson: '{"message":{"concurrentWinner":true}}' },
+              });
+            }
+            return orig(arg);
+          };
+        },
+      });
+    },
+  }) as Db;
+}
+
+/**
+ * A db stand-in that deletes the row and RE-RESERVES the same key (new
+ * requestHash, fresh createdAt, no response) between repairWedgedKey's read
+ * and its first guarded write. Pins the row-identity pin in the where clause
+ * (BLIND F1): {key, responseJson: null} alone would match the new live
+ * reservation — complete would write the marker over it, clear would delete it.
+ */
+function withResurrectionBetweenReadAndWrite(realDb: Db): Db {
+  return new Proxy(realDb, {
+    get(target, prop, receiver) {
+      if (prop !== 'idempotencyRecord') return Reflect.get(target, prop, receiver);
+      const model = Reflect.get(target, prop, receiver) as object;
+      let injected = false;
+      return new Proxy(model, {
+        get(m, mProp, mReceiver) {
+          if (mProp !== 'updateMany' && mProp !== 'deleteMany') return Reflect.get(m, mProp, mReceiver);
+          const orig = Reflect.get(m, mProp, mReceiver) as (arg: { where: { key: string } }) => Promise<unknown>;
+          return async (arg: { where: { key: string } }) => {
+            if (!injected) {
+              injected = true;
+              await realDb.idempotencyRecord.delete({ where: { key: arg.where.key } });
+              await realDb.idempotencyRecord.create({
+                data: {
+                  key: arg.where.key,
+                  operation: 'send-message',
+                  requestHash: 're-reserved',
+                  responseJson: null,
+                  createdAt: new Date(),
+                },
+              });
+            }
+            return orig(arg);
+          };
+        },
+      });
+    },
+  }) as Db;
+}
+
 const sendInput = (connectionId: string) => ({ connectionId, chatId: '555', text: 'hello' });
 
 /** Wedge one key via a real runOperation whose completion always fails. */
@@ -106,6 +178,18 @@ describe('repairWedgedKey — complete mode', () => {
 
     const row = await db.idempotencyRecord.findUnique({ where: { key: 'k-dry' } });
     expect(row!.responseJson).toBeNull();
+  });
+
+  it('dry-run plan for complete warns about the opposite failure: a fabricated success replays forever (BLIND F3)', async () => {
+    await db.idempotencyRecord.create({
+      data: { key: 'k-warn', operation: 'send-message', requestHash: 'a', responseJson: null, createdAt: new Date(Date.now() - 30 * 60_000) },
+    });
+    const outcome = await repairWedgedKey(db, 'k-warn', { mode: 'complete', confirm: false, minAgeMinutes: 0 });
+    expect(outcome.status).toBe('dry-run');
+    if (outcome.status === 'dry-run') {
+      expect(outcome.plan).toMatch(/did NOT actually happen/i);
+      expect(outcome.plan).toMatch(/never runs/i);
+    }
   });
 
   it('resolves the wedge: same-key retries replay the repair marker, the provider is NOT called again', async () => {
@@ -190,5 +274,68 @@ describe('repairWedgedKey — interlocks', () => {
     const missing = await repairWedgedKey(db, 'k-nope', { mode: 'clear', confirm: true, minAgeMinutes: 0 });
     expect(missing.status).toBe('refused');
     expect(missing.refusal).toBe('not-found');
+  });
+
+  it('write guard: a completion landing between the read and the write wins, both modes (LOCAL F1)', async () => {
+    // Complete mode: the concurrent completion must stand — no marker over it.
+    await db.idempotencyRecord.create({
+      data: { key: 'k-race-complete', operation: 'send-message', requestHash: 'a', responseJson: null, createdAt: new Date(Date.now() - 30 * 60_000) },
+    });
+    const completed = await repairWedgedKey(withCompletionBetweenReadAndWrite(db), 'k-race-complete', {
+      mode: 'complete',
+      confirm: true,
+      minAgeMinutes: 0,
+    });
+    expect(completed.status).toBe('refused');
+    expect(completed.refusal).toBe('already-completed');
+    const afterComplete = await db.idempotencyRecord.findUnique({ where: { key: 'k-race-complete' } });
+    expect(afterComplete!.responseJson).toBe('{"message":{"concurrentWinner":true}}');
+
+    // Clear mode: the concurrent completion must survive — the row is NOT deleted.
+    await db.idempotencyRecord.create({
+      data: { key: 'k-race-clear', operation: 'send-message', requestHash: 'b', responseJson: null, createdAt: new Date(Date.now() - 30 * 60_000) },
+    });
+    const cleared = await repairWedgedKey(withCompletionBetweenReadAndWrite(db), 'k-race-clear', {
+      mode: 'clear',
+      confirm: true,
+      minAgeMinutes: 0,
+    });
+    expect(cleared.status).toBe('refused');
+    expect(cleared.refusal).toBe('already-completed');
+    const afterClear = await db.idempotencyRecord.findUnique({ where: { key: 'k-race-clear' } });
+    expect(afterClear!.responseJson).toBe('{"message":{"concurrentWinner":true}}');
+  });
+
+  it('row-identity pin: a key deleted and re-reserved between the read and the write is not clobbered, both modes (BLIND F1)', async () => {
+    // Complete mode: the fresh reservation must stay response-less — no marker over it.
+    await db.idempotencyRecord.create({
+      data: { key: 'k-reres-complete', operation: 'send-message', requestHash: 'a', responseJson: null, createdAt: new Date(Date.now() - 30 * 60_000) },
+    });
+    const completed = await repairWedgedKey(withResurrectionBetweenReadAndWrite(db), 'k-reres-complete', {
+      mode: 'complete',
+      confirm: true,
+      minAgeMinutes: 0,
+    });
+    expect(completed.status).toBe('refused');
+    // The row that now exists is a NEW live reservation, not a completion.
+    expect(completed.refusal).toBe('too-young');
+    const afterComplete = await db.idempotencyRecord.findUnique({ where: { key: 'k-reres-complete' } });
+    expect(afterComplete!.responseJson).toBeNull();
+    expect(afterComplete!.requestHash).toBe('re-reserved');
+
+    // Clear mode: the fresh reservation must survive the delete.
+    await db.idempotencyRecord.create({
+      data: { key: 'k-reres-clear', operation: 'send-message', requestHash: 'b', responseJson: null, createdAt: new Date(Date.now() - 30 * 60_000) },
+    });
+    const cleared = await repairWedgedKey(withResurrectionBetweenReadAndWrite(db), 'k-reres-clear', {
+      mode: 'clear',
+      confirm: true,
+      minAgeMinutes: 0,
+    });
+    expect(cleared.status).toBe('refused');
+    expect(cleared.refusal).toBe('too-young');
+    const afterClear = await db.idempotencyRecord.findUnique({ where: { key: 'k-reres-clear' } });
+    expect(afterClear!.responseJson).toBeNull();
+    expect(afterClear!.requestHash).toBe('re-reserved');
   });
 });

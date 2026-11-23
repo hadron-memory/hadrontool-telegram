@@ -24,8 +24,10 @@
  *    (op failed, or crashed before the provider call), and a duplicate send
  *    when it did. The dry run names that risk; the confirmation owns it.
  *
- * Both writes are guarded (`… where responseJson: null`) so a repair can
- * never clobber a completion that landed concurrently.
+ * Both writes are guarded (`… where responseJson: null` plus the read row's
+ * requestHash and createdAt) so a repair can never clobber a completion that
+ * landed concurrently, nor a fresh reservation that replaced the judged row
+ * under the same key.
  */
 import type { Db } from '../db.js';
 import { OPERATIONS } from './index.js';
@@ -127,28 +129,41 @@ export async function repairWedgedKey(db: Db, key: string, opts: RepairOptions):
       duplicateSendRisk: opts.mode === 'clear' && mutating,
       plan:
         opts.mode === 'complete'
-          ? 'write a repair marker as the stored response; same-key retries replay it (no re-send)'
+          ? 'write a repair marker as the stored response; same-key retries replay it (no re-send). Opposite-failure risk: if the provider mutation did NOT actually happen, every future same-key retry replays a fabricated success and the operation never runs — confirm the completion-failed log line first'
           : 'delete the reservation; the next same-key request re-executes the operation',
     };
   }
 
   if (opts.mode === 'complete') {
+    // The where clause pins the EXACT row that was read (requestHash +
+    // createdAt) and that it still holds no response. {key, responseJson:
+    // null} alone would also match a row deleted and re-reserved under the
+    // same key between the read and this write — writing the marker over a
+    // live reservation (BLIND F1).
     const res = await db.idempotencyRecord.updateMany({
-      where: { key, responseJson: null },
+      where: { key, responseJson: null, requestHash: row.requestHash, createdAt: row.createdAt },
       data: { responseJson: repairedResponseMarker(row.operation, now) },
     });
     if (res.count === 0) return await reReadAfterGuardMiss(db, key);
     return { status: 'completed', row: view(row) };
   }
 
-  const res = await db.idempotencyRecord.deleteMany({ where: { key, responseJson: null } });
+  const res = await db.idempotencyRecord.deleteMany({
+    where: { key, responseJson: null, requestHash: row.requestHash, createdAt: row.createdAt },
+  });
   if (res.count === 0) return await reReadAfterGuardMiss(db, key);
   return { status: 'cleared', row: view(row) };
 }
 
-/** A guarded write that matched nothing: the row completed or vanished concurrently. */
+/**
+ * A guarded write that matched nothing: the row completed, vanished, or was
+ * replaced between the read and the write. A re-read row that still holds no
+ * response is NOT a completion — it is a fresh reservation replacing the one
+ * this repair judged, so it is reported as possibly in flight.
+ */
 async function reReadAfterGuardMiss(db: Db, key: string): Promise<RepairOutcome> {
   const again = await db.idempotencyRecord.findUnique({ where: { key } });
   if (!again) return { status: 'refused', refusal: 'not-found' };
+  if (again.responseJson == null) return { status: 'refused', refusal: 'too-young', row: view(again) };
   return { status: 'refused', refusal: 'already-completed', row: view(again) };
 }
