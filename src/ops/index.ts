@@ -26,6 +26,7 @@ import {
   mapTelegramError,
   validationFromZod,
 } from '../errors.js';
+import { logError } from '../logger.js';
 import { recordProviderBackoff, reserveSendSlot } from '../pacing.js';
 import type { TelegramProvider, TgMessage } from '../providers/botapi/types.js';
 
@@ -292,9 +293,45 @@ export async function runOperation(
   }
 
   if (useIdempotency) {
-    await db.idempotencyRecord
-      .update({ where: { key: idempotencyKey! }, data: { responseJson: JSON.stringify(result) } })
-      .catch(() => {});
+    await completeIdempotencyRecord(db, idempotencyKey!, name, result);
   }
   return { result, replayed: false };
+}
+
+/** Attempts to persist a completed idempotency record before giving up. */
+const COMPLETION_ATTEMPTS = 3;
+const COMPLETION_RETRY_MS = 250;
+
+/**
+ * Complete the in-flight reservation after the provider mutation succeeded
+ * (#1 F4): retried on transient DB failures, and SURFACED loudly when it
+ * keeps failing — never swallowed, and never thrown. Throwing here would make
+ * the caller retry a provider mutation that already happened (for send-class
+ * ops: a duplicate message), so the response must stand; the stuck record
+ * (responseJson null ⇒ same-key retries refused) becomes visible in the log
+ * instead of silently wedging the key forever.
+ */
+async function completeIdempotencyRecord(
+  db: Db,
+  key: string,
+  operation: string,
+  result: unknown,
+): Promise<void> {
+  const responseJson = JSON.stringify(result);
+  for (let attempt = 1; attempt <= COMPLETION_ATTEMPTS; attempt++) {
+    try {
+      await db.idempotencyRecord.update({ where: { key }, data: { responseJson } });
+      return;
+    } catch (err) {
+      if (attempt < COMPLETION_ATTEMPTS) {
+        await new Promise((resolve) => setTimeout(resolve, COMPLETION_RETRY_MS));
+        continue;
+      }
+      logError(
+        `idempotency completion failed for key ${key} (operation ${operation}) after ${COMPLETION_ATTEMPTS} attempts — ` +
+          `the provider mutation SUCCEEDED but the record is stuck in flight; same-key retries will be refused until this is repaired`,
+        err,
+      );
+    }
+  }
 }

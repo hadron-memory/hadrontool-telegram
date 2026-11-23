@@ -52,6 +52,16 @@ model Connection {
   lastUpdateId BigInt          @default(0) @map("last_update_id")
   /// Soft toggle — operator can pause polling without removing the bot.
   pollingEnabled Boolean       @default(true) @map("polling_enabled")
+  /// Poll-loop lease: which worker instance owns the getUpdates loop, and
+  /// until when (#1 F3). The process-local `running` Set cannot stop two
+  /// service instances (scale-out, overlapping rolling deploys) from running
+  /// competing loops per connection — Telegram answers the second long poll
+  /// with a 409. A worker may start a loop only after claiming this lease
+  /// (guarded update: unleased, already ours, or expired); the loop renews
+  /// it; a dead worker's lease expires and a survivor takes over. Both
+  /// columns are set and cleared together.
+  pollLeaseOwner     String?   @map("poll_lease_owner")
+  pollLeaseExpiresAt DateTime? @map("poll_lease_expires_at")
   createdAt   DateTime         @default(now()) @map("created_at")
   updatedAt   DateTime         @updatedAt @map("updated_at")
   deletedAt   DateTime?        @map("deleted_at")

@@ -63,3 +63,15 @@ export const config = {
 if (config.tokenEncryptionKey && !/^[0-9a-fA-F]{64}$/.test(config.tokenEncryptionKey)) {
   throw new Error('TOKEN_ENCRYPTION_KEY must be 64 hex chars (32 bytes) — refusing to start');
 }
+
+// #1 F1: an unset CORE_EVENTS_URL is deliberate drop-mode for dev and staged
+// rollouts — but in production with the poll worker running it would SILENTLY
+// and PERMANENTLY drop every inbound update: the forwarder's deliberate-skip
+// `true` advances the getUpdates cursor, which deletes the updates on
+// Telegram's side. A production env typo must stop the boot, not eat DMs. An
+// operator who truly wants an ops-only instance sets DISABLE_POLL_WORKER=true.
+if (isProduction && !config.disablePollWorker && !config.coreEventsUrl) {
+  throw new Error(
+    'CORE_EVENTS_URL is required in production while the poll worker is enabled — unset, inbound Telegram updates would be dropped silently (set DISABLE_POLL_WORKER=true for an ops-only instance) — refusing to start',
+  );
+}

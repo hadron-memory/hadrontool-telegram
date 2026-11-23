@@ -37,9 +37,11 @@ function gatedProvider() {
   let gate: Promise<void> = Promise.resolve();
   let inFlight = 0;
   let maxInFlight = 0;
+  let started = 0;
   const provider: TelegramProvider = {
     ...base,
     async getUpdates(botToken, offset, timeoutS) {
+      started += 1;
       inFlight += 1;
       maxInFlight = Math.max(maxInFlight, inFlight);
       try {
@@ -52,7 +54,8 @@ function gatedProvider() {
   };
   return {
     provider,
-    getUpdatesCalls: () => base.calls.filter(([m]) => m === 'getUpdates').length,
+    /** Calls that ENTERED getUpdates — countable while still gated blocked. */
+    getUpdatesStarted: () => started,
     maxInFlight: () => maxInFlight,
     block: () => {
       gate = new Promise<void>((resolve) => {
@@ -98,7 +101,7 @@ describe('single poll loop per connection across workers (F3)', () => {
     g.block();
     const w1 = startPollWorker(db, g.provider, noopForward);
     workers.push(w1);
-    await until(() => g.getUpdatesCalls() === 1, 'worker 1 starts its loop');
+    await until(() => g.getUpdatesStarted() === 1, 'worker 1 starts its loop');
 
     const w2 = startPollWorker(db, g.provider, noopForward);
     workers.push(w2);
@@ -106,7 +109,7 @@ describe('single poll loop per connection across workers (F3)', () => {
     // Give a would-be second loop every chance to (wrongly) start.
     await new Promise((resolve) => setTimeout(resolve, 100));
 
-    expect(g.getUpdatesCalls()).toBe(1);
+    expect(g.getUpdatesStarted()).toBe(1);
     // And the lease row names worker 1's instance as the owner.
     const row = await db.connection.findUnique({ where: { id: connectionId } });
     expect(row!.pollLeaseOwner).toBeTruthy();
@@ -120,12 +123,12 @@ describe('single poll loop per connection across workers (F3)', () => {
     g.block();
     const w1 = startPollWorker(db, g.provider, noopForward);
     workers.push(w1);
-    await until(() => g.getUpdatesCalls() === 1, 'worker 1 starts its loop');
+    await until(() => g.getUpdatesStarted() === 1, 'worker 1 starts its loop');
 
     const w2 = startPollWorker(db, g.provider, noopForward);
     workers.push(w2);
     await w2.reconcileNow();
-    expect(g.getUpdatesCalls()).toBe(1); // lease held: no second loop
+    expect(g.getUpdatesStarted()).toBe(1); // lease held: no second loop
 
     // Simulate worker 1's process dying mid-long-poll: its stop flag is set
     // (the loop exits on its next cycle), and time moves past its lease.
@@ -141,7 +144,7 @@ describe('single poll loop per connection across workers (F3)', () => {
 
     g.block(); // worker 2's loop will hang in its own long poll
     await w2.reconcileNow();
-    await until(() => g.getUpdatesCalls() === 2, 'worker 2 takes over the expired lease');
+    await until(() => g.getUpdatesStarted() === 2, 'worker 2 takes over the expired lease');
 
     // THE invariant: at no moment were two getUpdates calls in flight.
     expect(g.maxInFlight()).toBe(1);
@@ -154,7 +157,7 @@ describe('single poll loop per connection across workers (F3)', () => {
     g.block();
     const w1 = startPollWorker(db, g.provider, noopForward);
     workers.push(w1);
-    await until(() => g.getUpdatesCalls() === 1, 'worker 1 starts its loop');
+    await until(() => g.getUpdatesStarted() === 1, 'worker 1 starts its loop');
 
     // Disable polling: the current cycle finishes, the next drainOnce sees
     // 'stopped', and the loop must RELEASE the lease rather than leave it to
